@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/RequestSigning/RequestSigning.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/IsaTool.App/IsaTool.App.csproj" />
+    <Project Path="src/IsaTool.Core/IsaTool.Core.csproj" />
+    <Project Path="src/IsaTool.Plugins.Abstractions/IsaTool.Plugins.Abstractions.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/IsaTool.Tests/IsaTool.Tests.csproj" />
+  </Folder>
+</Solution>

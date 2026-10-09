@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <!-- Private=false: the host supplies this assembly; the plugin folder must not carry its own copy. -->
+    <ProjectReference Include="..\..\src\IsaTool.Plugins.Abstractions\IsaTool.Plugins.Abstractions.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

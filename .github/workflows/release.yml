@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - run: dotnet test IsaTool.slnx -c Release
+      - run: dotnet publish src/IsaTool.App -c Release -r ${{ matrix.rid }} --self-contained -p:PublishSingleFile=true -o out/${{ matrix.rid }}
+      - if: runner.os == 'Windows'
+        run: Compress-Archive -Path out/${{ matrix.rid }}/* -DestinationPath isatool-${{ matrix.rid }}.zip
+      - if: runner.os != 'Windows'
+        run: tar -czf isatool-${{ matrix.rid }}.tar.gz -C out/${{ matrix.rid }} .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rid }}
+          path: isatool-${{ matrix.rid }}.*
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
