@@ -7,6 +7,8 @@
     { "type": "perf", "section": "Performance" },
     { "type": "docs", "section": "Documentation" },
     { "type": "build", "section": "Build" },
-    { "type": "ci", "section": "Continuous Integration" }
+    { "type": "ci", "section": "Continuous Integration" },
+    { "type": "test", "section": "Tests" },
+    { "type": "chore", "section": "Maintenance" }
   ]
 }
