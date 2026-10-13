@@ -10,7 +10,7 @@ type(scope): description
 
 Common types include `feat`, `fix`, `docs`, `build`, `ci`, `refactor`, `test`, and `chore`. Add `!` after the type or scope for a breaking change, or include a `BREAKING CHANGE:` footer.
 
-Pull requests check every commit with commitlint. Merging conventional commits into `master` lets release-please prepare the next release and changelog.
+Pull requests check every commit with commitlint. Merging conventional commits into `main` lets release-please prepare the next release and changelog.
 
 ## Local checks
 
