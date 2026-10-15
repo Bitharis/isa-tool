@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      release-as:
+        description: Version to release from the current main branch, for example 1.2.0
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -17,3 +23,4 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          release-as: ${{ inputs.release-as }}
