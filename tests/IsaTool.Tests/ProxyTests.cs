@@ -170,6 +170,141 @@ public sealed class ProxyTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task Mitm_TerminatesTlsForwardsToServerAndRecordsFlow()
+    {
+        var upstreamCa = CertificateAuthority.LoadOrCreate(Path.Combine(_dir, "upstream"));
+        using var tcp = new TcpListener(IPAddress.Loopback, 0);
+        tcp.Start();
+        var upstreamPort = ((IPEndPoint)tcp.LocalEndpoint).Port;
+        _ = Task.Run(async () =>
+        {
+            using var socket = await tcp.AcceptTcpClientAsync();
+            await using var ssl = new SslStream(socket.GetStream());
+            await ssl.AuthenticateAsServerAsync(upstreamCa.GetLeaf("localhost"));
+            _ = await ssl.ReadAsync(new byte[4096]);
+            await ssl.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"));
+            await ssl.FlushAsync();
+        });
+
+        var ca = CertificateAuthority.LoadOrCreate(Path.Combine(_dir, "proxy"));
+        var store = new FlowStore();
+        using var server = new ProxyServer(ca, store, new ProxyOptions(
+            0, true, null, null, null, IPAddress.Loopback, new Uri($"https://localhost:{upstreamPort}")));
+        using var cts = new CancellationTokenSource();
+        var port = server.Start();
+        _ = server.RunAsync(cts.Token);
+
+        // No proxy settings: the client talks to the MITM listener as if it were the server.
+        using var client = new HttpClient(new SocketsHttpHandler
+        {
+            SslOptions = { RemoteCertificateValidationCallback = (_, cert, _, _) => cert is X509Certificate2 c && Trusts(ca.Certificate, c) },
+        });
+        Assert.Equal("hello", await client.GetStringAsync($"https://localhost:{port}/secure"));
+
+        var flow = Assert.Single(store.Snapshot());
+        Assert.Equal($"https://localhost:{upstreamPort}/secure", flow.Url);
+        Assert.Equal(200, flow.StatusCode);
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task Mitm_EndToEndOnLocalhost_CapturesGetAndPostOverOneKeepAliveConnection()
+    {
+        var serverCa = CertificateAuthority.LoadOrCreate(Path.Combine(_dir, "server"));
+        using var tcp = new TcpListener(IPAddress.Loopback, 0);
+        tcp.Start();
+        var serverPort = ((IPEndPoint)tcp.LocalEndpoint).Port;
+        var serverTask = Task.Run(async () =>
+        {
+            using var socket = await tcp.AcceptTcpClientAsync();
+            await using var ssl = new SslStream(socket.GetStream());
+            await ssl.AuthenticateAsServerAsync(serverCa.GetLeaf("localhost"));
+            var reader = new StreamReader(ssl, Encoding.ASCII);
+            while (true)
+            {
+                var requestLine = await reader.ReadLineAsync();
+                if (requestLine is null)
+                {
+                    return;
+                }
+
+                var length = 0;
+                string? line;
+                while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync()))
+                {
+                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        length = int.Parse(line["Content-Length:".Length..].Trim());
+                    }
+                }
+
+                var buffer = new char[length];
+                if (length > 0)
+                {
+                    await reader.ReadBlockAsync(buffer, 0, length);
+                }
+                var reply = $"{requestLine.Split(' ')[0]}:{new string(buffer)}";
+                await ssl.WriteAsync(Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {reply.Length}\r\n\r\n{reply}"));
+                await ssl.FlushAsync();
+            }
+        });
+
+        var proxyCa = CertificateAuthority.LoadOrCreate(Path.Combine(_dir, "proxy"));
+        var store = new FlowStore();
+        using var mitm = new ProxyServer(proxyCa, store, new ProxyOptions(
+            0, true, null, null, null, IPAddress.Loopback, new Uri($"https://localhost:{serverPort}")));
+        using var cts = new CancellationTokenSource();
+        var mitmPort = mitm.Start();
+        _ = mitm.RunAsync(cts.Token);
+
+        using var client = new HttpClient(new SocketsHttpHandler
+        {
+            SslOptions = { RemoteCertificateValidationCallback = (_, cert, _, _) => cert is X509Certificate2 c && Trusts(proxyCa.Certificate, c) },
+        }) { Timeout = TimeSpan.FromSeconds(15) };
+        var get = await client.GetStringAsync($"https://localhost:{mitmPort}/status");
+        var post = await (await client.PostAsync($"https://localhost:{mitmPort}/login", new StringContent("user=bob"))).Content
+            .ReadAsStringAsync();
+
+        Assert.Equal("GET:", get);
+        Assert.Equal("POST:user=bob", post);
+        var flows = store.Snapshot();
+        Assert.Equal(2, flows.Count);
+        Assert.Contains(flows, f => f.Method == "GET" && f.Url.EndsWith("/status") && f.StatusCode == 200);
+        var captured = Assert.Single(flows, f => f.Method == "POST");
+        Assert.Equal("user=bob", Encoding.UTF8.GetString(captured.RequestBody));
+        Assert.Equal("POST:user=bob", Encoding.UTF8.GetString(captured.ResponseBody));
+
+        await cts.CancelAsync();
+        client.Dispose();
+        mitm.Dispose();
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task Mitm_RejectsAbsoluteFormTargetsSoItIsNotAnOpenProxy()
+    {
+        var ca = CertificateAuthority.LoadOrCreate(Path.Combine(_dir, "proxy"));
+        var store = new FlowStore();
+        using var server = new ProxyServer(ca, store, new ProxyOptions(
+            0, false, null, null, null, IPAddress.Loopback, new Uri("http://127.0.0.1:1")));
+        using var cts = new CancellationTokenSource();
+        var port = server.Start();
+        _ = server.RunAsync(cts.Token);
+
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, port);
+        var stream = tcpClient.GetStream();
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("GET http://other.test/ HTTP/1.1\r\nHost: other.test\r\n\r\n"));
+        var buffer = new byte[256];
+        var read = await stream.ReadAsync(buffer);
+
+        Assert.StartsWith("HTTP/1.1 400", Encoding.ASCII.GetString(buffer, 0, read));
+        Assert.Empty(store.Snapshot());
+        await cts.CancelAsync();
+    }
+
     private (TestProxy Proxy, FlowStore Store, CancellationTokenSource Cts) StartProxy(
         bool ignoreUpstreamErrors, CaptureRules? rules = null)
     {

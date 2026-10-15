@@ -86,7 +86,18 @@ Press **Rules file** to create `proxy-rules.json` (in the IsaTool config directo
 | Any | `tag{value}` |
 
 `match` fields (all optional, all must match): `host` and `path` use `*` wildcards; `method` and `status` take lists (`POST,PUT`, `4xx,503`). A rule with `status` may only use response actions and `tag`. Body replacement is plain text on UTF-8 bodies (gzip/deflate/br are decoded first and the `Content-Encoding` header is removed). `redirectHost` changes the target and the `Host` header follows it. Python scripting for logic that rules can't express is planned as a later step.
-Limits: listens on loopback only; HTTP/1.1 only; bodies are buffered (no streaming or WebSocket); apps with certificate pinning will refuse the certificate (shown as a failed CONNECT). Captured traffic may contain credentials and lives in memory only.
+Limits: listens on loopback unless you set **Listen address**; HTTP/1.1 only; bodies are buffered (no streaming or WebSocket); apps with certificate pinning will refuse the certificate (shown as a failed CONNECT). Captured traffic may contain credentials and lives in memory only.
+
+#### MITM mode (reverse proxy)
+
+For clients that ignore proxy settings (for example a desktop client talking to its own server), put the tool *in front of the server*:
+
+1. Set **Forward to** to the real server, e.g. `https://192.168.1.10:55752` (TLS is terminated here and re-established to the server) or `http://host:port`.
+2. Set **Listen port** to a free port. If the client and server share a machine, either move the real server to another port or point the client at the tool's port. Set **Listen address** to `0.0.0.0` to accept clients from other machines (restrict with a firewall: anyone who can reach the port can send traffic to the forward target).
+3. Set **Trust server cert** to `yes` if the real server uses a self-signed or private certificate.
+4. Install the CA on the client machine, **Start proxy**, then configure the client to connect to the tool's address and port instead of the server.
+
+Only HTTP/1.1 is decoded. Binary protocols, HTTP/2 and gRPC are reported as a `RAW` flow and a failed TLS handshake as a `TLS` flow; neither is decoded. Absolute-form request targets are rejected so the listener cannot be used as an open proxy.
 
 Long-running tools stop with the Stop button or when you switch tools.
 

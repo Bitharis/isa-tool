@@ -15,10 +15,15 @@ public sealed record ProxyOptions(
     bool IgnoreUpstreamCertErrors = false,
     CaptureRules? Rules = null,
     RewriteRuleSet? Rewrites = null,
-    PluginHost? Plugins = null);
+    PluginHost? Plugins = null,
+    IPAddress? BindAddress = null,
+    Uri? ForwardTo = null);
 
 /// <summary>
-/// Loopback-only HTTP/HTTPS intercepting proxy. HTTPS is decrypted with leaf certificates from the local CA.
+/// HTTP/HTTPS intercepting proxy, loopback-only unless a bind address is given. In forward mode HTTPS is
+/// decrypted with leaf certificates from the local CA. When <see cref="ProxyOptions.ForwardTo"/> is set it acts as a
+/// man-in-the-middle in front of that server: clients connect to the listener directly (no proxy settings needed),
+/// and an https target means TLS is terminated here and re-established towards the real server.
 /// Bodies are buffered, so streaming responses and WebSocket upgrades are not supported.
 /// </summary>
 public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyOptions options) : IDisposable
@@ -34,16 +39,16 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
     private volatile RewriteRuleSet _rewrites = options.Rewrites ?? RewriteRuleSet.Empty;
     private TcpListener? _listener;
 
-    /// <summary>Gets the bound loopback port after the server starts.</summary>
+    /// <summary>Gets the bound port after the server starts.</summary>
     public int Port { get; private set; }
 
     /// <summary>Swaps the rewrite rules; applies to requests that start afterwards.</summary>
     public void SetRewrites(RewriteRuleSet rewrites) => _rewrites = rewrites;
 
-    /// <summary>Starts listening on the configured loopback port.</summary>
+    /// <summary>Starts listening on the configured address (loopback by default) and port.</summary>
     public int Start()
     {
-        _listener = new TcpListener(IPAddress.Loopback, options.Port);
+        _listener = new TcpListener(options.BindAddress ?? IPAddress.Loopback, options.Port);
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
         return Port;
@@ -101,6 +106,12 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
             try
             {
                 Stream stream = client.GetStream();
+                if (options.ForwardTo is { } target)
+                {
+                    await HandleReverseAsync(stream, target, ct).ConfigureAwait(false);
+                    return;
+                }
+
                 var reader = new WireReader(stream);
                 while (!ct.IsCancellationRequested)
                 {
@@ -127,6 +138,81 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
             {
                 // Client went away or sent garbage; nothing to report.
             }
+        }
+    }
+
+    private async Task HandleReverseAsync(Stream stream, Uri target, CancellationToken ct)
+    {
+        var tls = target.Scheme == Uri.UriSchemeHttps;
+        var authority = target.IsDefaultPort ? target.Host : $"{target.Host}:{target.Port}";
+        Stream wire = stream;
+        SslStream? ssl = null;
+        try
+        {
+            if (tls)
+            {
+                ssl = new SslStream(stream, false);
+                try
+                {
+                    await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                    {
+                        ServerCertificateSelectionCallback = (_, name) =>
+                            ca.GetLeaf(string.IsNullOrEmpty(name) ? target.Host : name),
+                        ApplicationProtocols = [SslApplicationProtocol.Http11],
+                    }, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or System.Security.Authentication.AuthenticationException)
+                {
+                    store.Add(new CapturedFlow
+                    {
+                        Method = "TLS",
+                        Url = authority,
+                        Error = $"TLS handshake with client failed (CA not trusted, certificate pinning, or client is not using TLS?): {ex.InnerException?.Message ?? ex.Message}",
+                    });
+                    return;
+                }
+
+                wire = ssl;
+            }
+
+            var reader = new WireReader(wire);
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    var head = await reader.ReadRequestHeadAsync(ct).ConfigureAwait(false);
+                    if (head is null)
+                    {
+                        return;
+                    }
+
+                    // Never let a client use the listener as an open proxy to other hosts.
+                    if (!head.Target.StartsWith('/'))
+                    {
+                        await WriteSimpleAsync(wire, 400, "Only origin-form request targets are accepted", ct)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (!await ForwardAsync(reader, wire, head, authority, ct, target.Scheme).ConfigureAwait(false))
+                    {
+                        return;
+                    }
+                }
+            }
+            catch (InvalidDataException)
+            {
+                store.Add(new CapturedFlow
+                {
+                    Method = "RAW",
+                    Url = authority,
+                    Error = "Client sent data that is not HTTP/1.1 (binary protocol, HTTP/2 or gRPC?). Not decoded.",
+                });
+            }
+        }
+        finally
+        {
+            ssl?.Dispose();
         }
     }
 
@@ -200,7 +286,8 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
 
     /// <summary>Returns whether the client connection can be reused.</summary>
     private async Task<bool> ForwardAsync(
-        WireReader reader, Stream client, RequestHead head, string? tunnelAuthority, CancellationToken ct)
+        WireReader reader, Stream client, RequestHead head, string? tunnelAuthority, CancellationToken ct,
+        string tunnelScheme = "https")
     {
         var sw = Stopwatch.StartNew();
         byte[] body;
@@ -218,7 +305,7 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
                          (head.Version == "HTTP/1.0" &&
                           !string.Equals(head.Header("Connection"), "keep-alive", StringComparison.OrdinalIgnoreCase));
 
-        if (!TryBuildUri(head, tunnelAuthority, out var uri))
+        if (!TryBuildUri(head, tunnelAuthority, tunnelScheme, out var uri))
         {
             await WriteSimpleAsync(client, 400, "Cannot determine target URL", ct).ConfigureAwait(false);
             return false;
@@ -335,7 +422,7 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
         return !closeAfter;
     }
 
-    private static bool TryBuildUri(RequestHead head, string? tunnelAuthority, out Uri uri)
+    private static bool TryBuildUri(RequestHead head, string? tunnelAuthority, string tunnelScheme, out Uri uri)
     {
         if (head.Target.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             head.Target.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -344,7 +431,7 @@ public sealed class ProxyServer(CertificateAuthority ca, FlowStore store, ProxyO
         }
 
         var authority = tunnelAuthority ?? head.Header("Host");
-        var scheme = tunnelAuthority is null ? "http" : "https";
+        var scheme = tunnelAuthority is null ? "http" : tunnelScheme;
         if (authority is null || !head.Target.StartsWith('/'))
         {
             uri = null!;

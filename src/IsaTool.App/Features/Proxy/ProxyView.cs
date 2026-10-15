@@ -16,6 +16,12 @@ public sealed class ProxySettings
     public string Status { get; set; } = string.Empty;
 
     public string ContentType { get; set; } = string.Empty;
+
+    public string ListenAddress { get; set; } = "127.0.0.1";
+
+    public string ForwardTo { get; set; } = string.Empty;
+
+    public string TrustServerCert { get; set; } = "no";
 }
 
 /// <summary>Provides the interactive interface for the intercepting proxy.</summary>
@@ -33,6 +39,9 @@ public sealed class ProxyView : FeatureView
     {
         var saved = _settings.Load<ProxySettings>(SettingsName);
         var port = AddField("Listen port", "8888");
+        var address = AddField("Listen address", string.IsNullOrWhiteSpace(saved.ListenAddress) ? "127.0.0.1" : saved.ListenAddress);
+        var forward = AddField("Forward to (MITM)", saved.ForwardTo);
+        var trust = AddField("Trust server cert (yes/no)", saved.TrustServerCert);
         var only = AddField("Only hosts", saved.OnlyHosts);
         var ignore = AddField("Ignore hosts", saved.IgnoreHosts);
         var search = AddField("Search", saved.Search);
@@ -47,6 +56,9 @@ public sealed class ProxyView : FeatureView
             Search = search.Text,
             Status = status.Text,
             ContentType = type.Text,
+            ListenAddress = address.Text,
+            ForwardTo = forward.Text,
+            TrustServerCert = trust.Text,
         });
 
         void ApplyFilter()
@@ -62,13 +74,31 @@ public sealed class ProxyView : FeatureView
         AddButton("Start proxy", async ct =>
         {
             _ = int.TryParse(port.Text, out var p);
+            var bindText = address.Text.Trim();
+            if (!System.Net.IPAddress.TryParse(string.IsNullOrEmpty(bindText) ? "127.0.0.1" : bindText, out var bind))
+            {
+                SetOutput($"Invalid listen address \"{bindText}\". Use an IP such as 127.0.0.1 or 0.0.0.0.");
+                return;
+            }
+
+            Uri? forwardTo = null;
+            var forwardText = forward.Text.Trim();
+            if (forwardText.Length > 0 &&
+                (!Uri.TryCreate(forwardText, UriKind.Absolute, out forwardTo) ||
+                 (forwardTo.Scheme != Uri.UriSchemeHttp && forwardTo.Scheme != Uri.UriSchemeHttps)))
+            {
+                SetOutput($"Invalid forward target \"{forwardText}\". Use http://host:port or https://host:port.");
+                return;
+            }
+
             var rules = new CaptureRules(only.Text, ignore.Text);
             var rewrites = LoadRules(out var rulesNote);
             PluginHost.Shared.Reload();
             Persist();
             var ca = CertificateAuthority.LoadOrCreate(CertificateAuthority.DefaultDirectory);
+            var trustServer = trust.Text.Trim().StartsWith('y');
             using var server = new ProxyServer(ca, _store,
-                new ProxyOptions(p > 0 ? p : 8888, Rules: rules, Rewrites: rewrites, Plugins: PluginHost.Shared));
+                new ProxyOptions(p > 0 ? p : 8888, trustServer, rules, rewrites, PluginHost.Shared, bind, forwardTo));
             int actual;
             try
             {
@@ -76,7 +106,7 @@ public sealed class ProxyView : FeatureView
             }
             catch (System.Net.Sockets.SocketException ex)
             {
-                SetOutput($"Cannot listen on port {p}: {ex.Message}");
+                SetOutput($"Cannot listen on {bind}:{p}: {ex.Message}");
                 return;
             }
 
@@ -84,7 +114,15 @@ public sealed class ProxyView : FeatureView
             Refresh();
             _server = server;
             var serving = server.RunAsync(ct);
-            AppendOutput($"\nListening on 127.0.0.1:{actual}. HTTPS is DECRYPTED with CA \"{CertificateAuthority.CommonName}\".\n{rulesNote}\n");
+            var mode = forwardTo is null
+                ? $"Listening on {bind}:{actual} as a proxy. HTTPS is DECRYPTED with CA \"{CertificateAuthority.CommonName}\"."
+                : $"Listening on {bind}:{actual} as a MITM in front of {forwardTo.GetLeftPart(UriPartial.Authority)}" +
+                  (forwardTo.Scheme == Uri.UriSchemeHttps
+                      ? $". TLS is DECRYPTED with CA \"{CertificateAuthority.CommonName}\"; point the client at this address instead of the server."
+                      : ". Point the client at this address instead of the server.");
+            var exposed = bind.Equals(System.Net.IPAddress.Loopback) ? string.Empty
+                : "\nWARNING: listening beyond loopback; anyone who can reach this port can send traffic through it. Restrict it with a firewall.";
+            AppendOutput($"\n{mode}{exposed}\n{rulesNote}\n");
 
             var seen = -1;
             using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
@@ -156,8 +194,12 @@ public sealed class ProxyView : FeatureView
             SetOutput(note + (_server is null ? "\n(applied when the proxy starts)" : "\n(applied to new requests)"));
         });
         Build();
-        SetOutput("Point your client at 127.0.0.1:<port> (e.g. HTTPS_PROXY=http://127.0.0.1:8888).\n" +
-                  "For HTTPS, first install the CA: press \"CA info / install help\".\n\n" +
+        SetOutput("PROXY MODE (Forward to empty): point your client at 127.0.0.1:<port> (e.g. HTTPS_PROXY=http://127.0.0.1:8888).\n" +
+                  "MITM MODE (Forward to = https://server:port or http://server:port): the client connects to this tool\n" +
+                  "  instead of the server; the tool forwards to the real server and records every request. Use Listen address\n" +
+                  "  0.0.0.0 to accept clients from other machines. Set Trust server cert to yes for self-signed server certs.\n" +
+                  "  Only HTTP/1.1 is decoded; other protocols are reported as RAW.\n" +
+                  "For HTTPS, first install the CA on the client: press \"CA info / install help\".\n\n"+
                   "CAPTURE (applied on Start): Only hosts / Ignore hosts, e.g. api.corp.com, *.corp.com.\n" +
                   "  Non-matching HTTPS hosts are tunnelled untouched (not decrypted, not recorded).\n" +
                   "VIEW (press Apply filter): Search text, Status (e.g. 4xx,5xx,404,err), Content type (e.g. json,xml).");
